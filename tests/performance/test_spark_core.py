@@ -1,3 +1,4 @@
+import os
 import time
 import pytest
 from pyhive import hive
@@ -21,10 +22,10 @@ Measures how long a single Thrift connection takes to open.
 def test_connection_establishment_time():
     start = time.perf_counter()
     conn = hive.Connection(
-        host="spark_db",
+        host=spark_db,
         port=10000,
         username="dbt",
-        auth="NOSASL"
+        auth="NOSASL",
     )
     elapsed = time.perf_counter() - start
     conn.close()
@@ -54,14 +55,14 @@ def test_large_table_creation_10k(thrift_connection):
     cursor.execute("DROP TABLE IF EXISTS perf_test_10k")
 
     values = ", ".join(f"({i}, 'name_{i}', {i * 1.5})" for i in range(10000))
-    sql = f"CREATE TABLE perf_test_1k (id INT, name STRING, value DOUBLE) AS SELECT * FROM (VALUES {values}) t(id, name, value)"
+    sql = f"CREATE TABLE perf_test_10k (id INT, name STRING, value DOUBLE) AS SELECT * FROM (VALUES {values}) t(id, name, value)"
 
     start = time.perf_counter()
     cursor.execute(sql)
     elapsed = time.perf_counter() - start
 
     print(f"\n[perf] 1k table creation: {elapsed:.3f}s")
-    assert elapsed < 60, f"1k table creation took {elapsed:.3f}s, expected < 60s"
+    assert elapsed < 60, f"10k table creation took {elapsed:.3f}s, expected < 60s"
     cursor.close()
 
 '''
