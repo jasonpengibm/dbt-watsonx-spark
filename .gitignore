@@ -46,3 +46,6 @@ test.env
 dbt-integration-tests
 /.tool-versions
 /.hypothesis/*
+
+metastore_db/
+derby.log
