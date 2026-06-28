@@ -1,12 +1,7 @@
-import os
 import time
 import pytest
 from pyhive import hive
-
-_HOST = os.environ.get("SPARK_THRIFT_HOST", "localhost")
-_PORT = int(os.environ.get("SPARK_THRIFT_PORT", 10000))
-_USER = os.environ.get("SPARK_THRIFT_USER", "dbt")
-_AUTH = os.environ.get("SPARK_THRIFT_AUTH", "NOSASL")
+from tests.performance.conftest import _HOST, _PORT, _USER, _AUTH
 
 pytestmark = [
     pytest.mark.performance,
