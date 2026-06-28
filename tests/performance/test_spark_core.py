@@ -3,6 +3,11 @@ import time
 import pytest
 from pyhive import hive
 
+_HOST = os.environ.get("SPARK_THRIFT_HOST", "localhost")
+_PORT = int(os.environ.get("SPARK_THRIFT_PORT", 10000))
+_USER = os.environ.get("SPARK_THRIFT_USER", "dbt")
+_AUTH = os.environ.get("SPARK_THRIFT_AUTH", "NOSASL")
+
 pytestmark = [
     pytest.mark.performance,
     pytest.mark.skip_profile("spark_session"),
@@ -22,10 +27,10 @@ Measures how long a single Thrift connection takes to open.
 def test_connection_establishment_time():
     start = time.perf_counter()
     conn = hive.Connection(
-        host=spark_db,
-        port=10000,
-        username="dbt",
-        auth="NOSASL",
+        host=_HOST,
+        port=_PORT,
+        username=_USER,
+        auth=_AUTH,
     )
     elapsed = time.perf_counter() - start
     conn.close()
@@ -39,8 +44,14 @@ def test_large_table_creation_1k(thrift_connection):
     cursor = thrift_connection.cursor()
     cursor.execute("DROP TABLE IF EXISTS perf_test_1k")
 
-    values = ", ".join(f"({i}, 'name_{i}', {i * 1.5})" for i in range(1000))
-    sql = f"CREATE TABLE perf_test_1k (id INT, name STRING, value DOUBLE) AS SELECT * FROM (VALUES {values}) t(id, name, value)"
+    sql = """
+        CREATE TABLE perf_test_1k
+        AS SELECT
+            CAST(id AS INT)                      AS id,
+            CONCAT('name_', CAST(id AS STRING))  AS name,
+            CAST(id AS DOUBLE) * 1.5             AS value
+        FROM (SELECT explode(sequence(0, 999)) AS id) t
+    """
 
     start = time.perf_counter()
     cursor.execute(sql)
@@ -54,14 +65,20 @@ def test_large_table_creation_10k(thrift_connection):
     cursor = thrift_connection.cursor()
     cursor.execute("DROP TABLE IF EXISTS perf_test_10k")
 
-    values = ", ".join(f"({i}, 'name_{i}', {i * 1.5})" for i in range(10000))
-    sql = f"CREATE TABLE perf_test_10k (id INT, name STRING, value DOUBLE) AS SELECT * FROM (VALUES {values}) t(id, name, value)"
+    sql = """
+        CREATE TABLE perf_test_10k
+        AS SELECT
+            CAST(id AS INT)                      AS id,
+            CONCAT('name_', CAST(id AS STRING))  AS name,
+            CAST(id AS DOUBLE) * 1.5             AS value
+        FROM (SELECT explode(sequence(0, 9999)) AS id) t
+    """
 
     start = time.perf_counter()
     cursor.execute(sql)
     elapsed = time.perf_counter() - start
 
-    print(f"\n[perf] 1k table creation: {elapsed:.3f}s")
+    print(f"\n[perf] 10k table creation: {elapsed:.3f}s")
     assert elapsed < 60, f"10k table creation took {elapsed:.3f}s, expected < 60s"
     cursor.close()
 

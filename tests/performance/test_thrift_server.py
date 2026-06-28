@@ -1,9 +1,15 @@
+import os
 import time
 import queue
 import threading
 import statistics
 import pytest
 from pyhive import hive
+
+_HOST = os.environ.get("SPARK_THRIFT_HOST", "localhost")
+_PORT = int(os.environ.get("SPARK_THRIFT_PORT", 10000))
+_USER = os.environ.get("SPARK_THRIFT_USER", "dbt")
+_AUTH = os.environ.get("SPARK_THRIFT_AUTH", "NOSASL")
 
 pytestmark = [
     pytest.mark.performance,
@@ -17,11 +23,14 @@ Test file should be runnable in isolation, so recreate table to avoid 'no table 
 def setup_large_table(thrift_connection):
     cursor = thrift_connection.cursor()
     cursor.execute("DROP TABLE IF EXISTS perf_test_10k")
-    values = ", ".join(f"({i}, 'name_{i}', {i * 1.5})" for i in range(10000))
-    sql = (
-        f"CREATE TABLE perf_test_10k (id INT, name STRING, value DOUBLE) "
-        f"AS SELECT * FROM (VALUES {values}) t(id, name, value)"
-    )
+    sql = """
+        CREATE TABLE perf_test_10k
+        AS SELECT
+            CAST(id AS INT)                      AS id,
+            CONCAT('name_', CAST(id AS STRING))  AS name,
+            CAST(id AS DOUBLE) * 1.5             AS value
+        FROM (SELECT explode(sequence(0, 9999)) AS id) t
+    """
     cursor.execute(sql)
     cursor.close()
     yield
@@ -33,19 +42,19 @@ def setup_large_table(thrift_connection):
 Records per query latency (send + receive), track median for consistency and max for worst case behavior
 Asserts median latency < 2s & max latency < 5s
 '''
-def test_query_round_trip_latency():
+def test_query_round_trip_latency(thrift_connection):
     cursor = thrift_connection.cursor()
     latencies = []
-    
+
     for _ in range(10):
         start = time.perf_counter()
         cursor.execute("SELECT 1")
         cursor.fetchall()
         latencies.append(time.perf_counter() - start)
-    
+
     cursor.close()
     median_latency = statistics.median(latencies)
-    max_latency = statistics.max(latencies)
+    max_latency = max(latencies)
 
     print(f"\n[perf] round-trip latency — median: {median_latency:.3f}s, max: {max_latency:.3f}s")
     assert median_latency < 2, f"Median latency {median_latency:.3f}s exceeded 2s"
@@ -56,15 +65,15 @@ Test connection establishment time under concurrent connections
 Asserts all connections complete within 15s and no exceptions are raised
 '''
 def test_concurrent_connections():
-    results = queue.Queue
+    results = queue.Queue()
 
     def connect_and_query():
         try:
             conn = hive.Connection(
-                host="spark_db",
-                port=10000,
-                username="dbt",
-                auth="NOSASL"
+                host=_HOST,
+                port=_PORT,
+                username=_USER,
+                auth=_AUTH,
             )
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
@@ -95,7 +104,7 @@ def test_concurrent_connections():
 
     errors = []
     while not results.empty():
-        status, exc = results.get():
+        status, exc = results.get()
         if status == "error":
             errors.append(str(exc))
     
