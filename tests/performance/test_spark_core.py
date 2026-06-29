@@ -1,10 +1,12 @@
 import time
 import pytest
+import psutil
 from pyhive import hive
 import queue
 import threading
 import statistics
 from tests.performance.conftest import _HOST, _PORT, _USER, _AUTH
+from tests.performance.memory_utils import profile_memory
 
 pytestmark = [
     pytest.mark.performance,
@@ -157,3 +159,96 @@ def test_concurrent_spark_operations():
         f"per-job max: {max(job_times):.3f}s"
     )
     assert total_elapsed < 60, f"Concurrent Spark jobs took {total_elapsed:.3f}s, expected < 60s"
+
+
+'''
+Opens 20 connections concurrently and measures OS-level RSS growth.
+A failure here points to a connection-lifecycle leak in the adapter.
+'''
+def test_memory_concurrent_connections():
+    import gc
+    gc.collect()
+    rss_before = psutil.Process().memory_info().rss
+
+    results = queue.Queue()
+
+    def open_run_close(job_id):
+        try:
+            conn = hive.Connection(
+                host=_HOST,
+                port=_PORT,
+                username=_USER,
+                auth=_AUTH,
+            )
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchall()
+            cursor.close()
+            conn.close()
+            results.put(("ok", job_id))
+        except Exception as e:
+            results.put(("error", job_id, str(e)))
+
+    num_connections = 20
+    threads = [threading.Thread(target=open_run_close, args=(i,)) for i in range(num_connections)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    hung = [t for t in threads if t.is_alive()]
+    assert not hung, f"{len(hung)} connection thread(s) did not finish within 60s"
+
+    errors = []
+    while not results.empty():
+        item = results.get()
+        if item[0] == "error":
+            errors.append(f"Thread {item[1]}: {item[2]}")
+    assert not errors, f"Connection threads raised exceptions: {errors}"
+
+    gc.collect()
+    rss_after = psutil.Process().memory_info().rss
+    rss_delta_mb = (rss_after - rss_before) / (1024 ** 2)
+    print(f"\n[mem] concurrent_connections: rss_delta={rss_delta_mb:.1f} MB")
+    assert rss_delta_mb < 150, f"RSS grew by {rss_delta_mb:.1f} MB across 20 connections, expected < 150 MB"
+
+
+'''
+Opens and closes 20 cursors sequentially on the shared connection.
+'''
+def test_memory_no_leak_after_cursor_close(thrift_connection):
+    def run():
+        for _ in range(20):
+            cursor = thrift_connection.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchall()
+            cursor.close()
+
+    result = profile_memory(run, label="cursor_close_leak")
+    assert result["rss_after_mb"] <= result["rss_before_mb"] * 1.15, (
+        f"RSS grew from {result['rss_before_mb']:.1f} MB to {result['rss_after_mb']:.1f} MB "
+        f"(delta {result['rss_delta_mb']:.1f} MB) after 20 cursor close cycles — possible leak"
+    )
+
+
+'''
+Runs 20 cursor executions against a nonexistent table
+Measure if an exception raised during SQL execution leaves any unreclaimed memory (accumulation into memory leak )
+Failure means adapter not succssfully cleaning up cursors. 
+'''
+def test_memory_no_leak_on_exception(thrift_connection):
+    def run():
+        for _ in range(20):
+            cursor = thrift_connection.cursor()
+            try:
+                cursor.execute("SELECT * FROM nonexistent_table_xyz")
+            except Exception:
+                pass
+            finally:
+                cursor.close()
+
+    result = profile_memory(run, label="exception_cursor_leak")
+    assert result["rss_delta_mb"] < 30, (
+        f"RSS grew by {result['rss_delta_mb']:.1f} MB across 20 exception-path cursor cycles, "
+        f"expected < 30 MB — possible session resource leak on exception"
+    )
