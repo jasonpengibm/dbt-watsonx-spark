@@ -21,6 +21,11 @@ unit: ## Runs unit tests with py38.
 	@\
 	python -m pytest tests/unit
 
+.PHONY: perf
+perf: ## Runs performance tests against the local Apache Spark Thrift container via Dagger.
+	@\
+	python dagger/run_dbt_spark_tests.py --profile apache_spark --test-path tests/performance --markers performance
+
 .PHONY: test
 test: ## Runs unit tests with py38 and code checks against staged changes.
 	@\
