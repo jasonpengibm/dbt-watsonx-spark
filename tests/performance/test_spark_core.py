@@ -198,10 +198,9 @@ class TestMemoryUsage(unittest.TestCase):
     """
     def test_memory_concurrent_connections(self):
 
-        # Force garbage collection to avoid snapshot including pages that were freed but haven't been returned to the OS
+        # Force garbage collection before measuring so unrelated pending
+        # garbage from prior tests doesn't affect the base RSS amount
         gc.collect()
-
-        # Sample RSS before operation
         rss_before = psutil.Process().memory_info().rss
 
         results = queue.Queue()
@@ -223,7 +222,6 @@ class TestMemoryUsage(unittest.TestCase):
             except Exception as e:
                 results.put(("error", job_id, str(e)))
 
-        # Start 20 threads simultaneously, with independent Thrift connections 
         num_connections = 20
         threads = [threading.Thread(target=open_run_close, args=(i,)) for i in range(num_connections)]
         for t in threads:
@@ -240,7 +238,8 @@ class TestMemoryUsage(unittest.TestCase):
             if item[0] == "error":
                 errors.append(f"Thread {item[1]}: {item[2]}")
         self.assertFalse(errors, f"Connection threads raised exceptions: {errors}")
-
+        
+        # Collect again post-run so RSS does not reflect garbage waiting to be cleaned
         gc.collect()
 
         # Sample RSS after operation, memory should return near starting point after all connections torn down 

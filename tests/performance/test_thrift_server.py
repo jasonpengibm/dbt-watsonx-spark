@@ -86,7 +86,6 @@ class TestThriftServerPerformance(unittest.TestCase):
             except Exception as e:
                 results.put(("error", e))
 
-        # open 5 concurrent connections 
         threads = [threading.Thread(target=connect_and_query) for _ in range(5)]
 
         start = time.perf_counter()
@@ -98,6 +97,8 @@ class TestThriftServerPerformance(unittest.TestCase):
 
         elapsed = time.perf_counter() - start
 
+        # Check for hung threads before the elapsed time assertion, so a stuck
+        # thread is reported as a hang rather than a slow run
         hung_threads = [t for t in threads if t.is_alive()]
         self.assertFalse(hung_threads, f"{len(hung_threads)} threads did not complete within 15s")
 
