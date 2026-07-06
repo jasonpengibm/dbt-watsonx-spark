@@ -6,7 +6,7 @@ import queue
 import threading
 import statistics
 from tests.performance.conftest import _HOST, _PORT, _USER, _AUTH
-from tests.performance.memory_utils import profile_memory
+from tests.performance.utils.memory_utils import profile_memory
 import unittest
 import gc
 

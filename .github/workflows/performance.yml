@@ -1,0 +1,127 @@
+# **what?**
+# Runs the performance test suite against a local PySpark Thrift server
+# started via Docker Compose.  Tests are gated on the `performance` pytest
+# mark and require the Spark service to be healthy before they run.
+
+# **why?**
+# Performance benchmarks need a live Thrift connection and must not block
+# the fast unit-test workflow.  A dedicated job keeps latency/memory
+# regressions visible without slowing down every PR.
+
+# **when?**
+# Runs on pushes to main / release branches, on any pull_request, and can
+# be triggered manually via workflow_dispatch.
+
+name: Performance Tests
+
+on:
+  push:
+    branches:
+      - "main"
+      - "*.latest"
+  pull_request:
+  workflow_dispatch:
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ contains(github.event_name, 'pull_request') && github.event.pull_request.head.ref || github.sha }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  performance:
+    name: performance tests / python ${{ matrix.python-version }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    services:
+      # Postgres backing store for the Hive metastore
+      dbt-hive-metastore:
+        image: postgres:9-alpine
+        env:
+          POSTGRES_USER: dbt
+          POSTGRES_PASSWORD: dbt
+          POSTGRES_DB: metastore
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsasl2-dev
+          python -m pip install --user --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r dev-requirements.txt
+          python -m pip install -e .
+
+      - name: Start Spark Thrift server (Docker Compose)
+        run: docker compose up -d dbt-spark3-thrift
+
+      - name: Wait for Thrift server to be ready
+        run: |
+          echo "Waiting for Spark Thrift server on port 10000..."
+          for i in $(seq 1 30); do
+            if nc -z localhost 10000; then
+              echo "Thrift server is up after ${i} attempts"
+              exit 0
+            fi
+            echo "Attempt ${i}/30 — not ready yet, sleeping 10s"
+            sleep 10
+          done
+          echo "Thrift server did not become ready in time" >&2
+          docker compose logs dbt-spark3-thrift
+          exit 1
+
+      - name: Run performance tests
+        env:
+          SPARK_THRIFT_HOST: localhost
+          SPARK_THRIFT_PORT: "10000"
+          SPARK_THRIFT_USER: dbt
+          SPARK_THRIFT_AUTH: NOSASL
+        run: |
+          python -m pytest \
+            --color=yes \
+            --csv performance_results.csv \
+            -v \
+            -m performance \
+            tests/performance
+
+      - name: Get current date
+        if: always()
+        id: date
+        run: echo "date=$(date +'%Y-%m-%dT%H_%M_%S')" >> $GITHUB_OUTPUT
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance_results_${{ matrix.python-version }}-${{ steps.date.outputs.date }}.csv
+          path: performance_results.csv
+
+      - name: Tear down Docker Compose
+        if: always()
+        run: docker compose down -v
