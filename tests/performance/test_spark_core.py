@@ -1,4 +1,5 @@
 import gc
+import logging
 import queue
 import statistics
 import threading
@@ -11,6 +12,9 @@ from pyhive import hive
 
 from tests.performance.conftest import _HOST, _PORT, _USER, _AUTH
 from tests.performance.utils.memory_utils import profile_memory
+from tests.performance.utils.spark_metrics import get_executor_metrics
+
+log = logging.getLogger(__name__)
 
 pytestmark = [
     pytest.mark.performance,
@@ -50,7 +54,7 @@ class TestConnectionAndQueryPerformance(unittest.TestCase):
         )
         elapsed = time.perf_counter() - start
         conn.close()
-        print(f"\n[perf][{self.backend}] connection establishment: {elapsed:.3f}s")
+        log.info("[perf][%s] connection establishment: %.3fs", self.backend, elapsed)
         self.assertLess(elapsed, 10, f"Connection took {elapsed:.3f}s, expected < 10s")
 
     def test_query_run_time(self):
@@ -62,9 +66,9 @@ class TestConnectionAndQueryPerformance(unittest.TestCase):
         elapsed = time.perf_counter() - start
         cursor.close()
 
-        print(
-            f"\n[perf][{self.backend}] COUNT(*) on {self.ref_table}: "
-            f"{elapsed:.3f}s, rows: {result[0][0]}"
+        log.info(
+            "[perf][%s] COUNT(*) on %s: %.3fs, rows: %d",
+            self.backend, self.ref_table, elapsed, result[0][0],
         )
         self.assertEqual(result[0][0], 10000, f"Expected 10000 rows, got {result[0][0]}")
         self.assertLess(elapsed, 5, f"Query took {elapsed:.3f}s, expected < 5s")
@@ -134,11 +138,10 @@ class TestConcurrentOperations(unittest.TestCase):
         # Thread could exit early due to a swallowed exception; ensure it accounts for itself
         self.assertEqual(len(job_times), num_jobs, f"Expected {num_jobs} results, got {len(job_times)}")
 
-        print(
-            f"\n[perf][{self.backend}] {num_jobs} concurrent Spark jobs:\n"
-            f"total: {total_elapsed:.3f}s\n"
-            f"per-job median: {statistics.median(job_times):.3f}s\n"
-            f"per-job max: {max(job_times):.3f}s"
+        log.info(
+            "[perf][%s] %d concurrent Spark jobs: total=%.3fs median=%.3fs max=%.3fs",
+            self.backend, num_jobs, total_elapsed,
+            statistics.median(job_times), max(job_times),
         )
         self.assertLess(total_elapsed, 60, f"Concurrent Spark jobs took {total_elapsed:.3f}s, expected < 60s")
 
@@ -198,7 +201,7 @@ class TestMemoryUsage(unittest.TestCase):
         gc.collect()
         rss_after = psutil.Process().memory_info().rss
         rss_delta_mb = (rss_after - rss_before) / (1024 ** 2)
-        print(f"\n[mem][{self.backend}] concurrent_connections: rss_delta={rss_delta_mb:.1f} MB")
+        log.info("[mem][%s] concurrent_connections: rss_delta=%.1f MB", self.backend, rss_delta_mb)
         self.assertLess(
             rss_delta_mb, 150,
             f"RSS grew by {rss_delta_mb:.1f} MB across 20 connections, expected < 150 MB"
@@ -270,15 +273,34 @@ class TestDDLAndWritePathPerformance(unittest.TestCase):
         cursor = self.conn.cursor()
         cursor.execute("DROP TABLE IF EXISTS perf_ctas_out")
 
+        metrics_before = get_executor_metrics()
+
         start = time.perf_counter()
         cursor.execute(
             f"CREATE TABLE perf_ctas_out AS SELECT * FROM {self.ref_table}"
         )
         elapsed = time.perf_counter() - start
+
+        metrics_after = get_executor_metrics()
         cursor.close()
 
-        print(f"\n[perf][{self.backend}] CTAS from {self.ref_table}: {elapsed:.3f}s")
+        heap_delta = (
+            metrics_after.get("executor_heap_used_mb", 0)
+            - metrics_before.get("executor_heap_used_mb", 0)
+        )
+        log.info(
+            "[perf][%s] CTAS from %s: %.3fs | driver_heap=%.1fMB heap_delta=%.1fMB tasks=%s",
+            self.backend, self.ref_table, elapsed,
+            metrics_after.get("driver_heap_used_mb", 0),
+            heap_delta,
+            metrics_after.get("executor_total_tasks", 0),
+        )
         self.assertLess(elapsed, 30, f"CTAS took {elapsed:.3f}s, expected < 30s")
+        # Executor heap shouldn't blow out on a 10k row CTAS
+        self.assertLess(
+            metrics_after.get("executor_heap_used_mb", 0), 512,
+            f"Executor heap reached {metrics_after.get('executor_heap_used_mb', 0):.1f} MB during CTAS"
+        )
 
     def test_insert_into_select(self):
         """
@@ -299,7 +321,7 @@ class TestDDLAndWritePathPerformance(unittest.TestCase):
         elapsed = time.perf_counter() - start
         cursor.close()
 
-        print(f"\n[perf][{self.backend}] INSERT INTO from {self.ref_table}: {elapsed:.3f}s")
+        log.info("[perf][%s] INSERT INTO from %s: %.3fs", self.backend, self.ref_table, elapsed)
         self.assertLess(elapsed, 30, f"INSERT INTO took {elapsed:.3f}s, expected < 30s")
 
     def test_drop_table(self):
@@ -319,7 +341,7 @@ class TestDDLAndWritePathPerformance(unittest.TestCase):
         elapsed = time.perf_counter() - start
         cursor.close()
 
-        print(f"\n[perf][{self.backend}] DROP TABLE: {elapsed:.3f}s")
+        log.info("[perf][%s] DROP TABLE: %.3fs", self.backend, elapsed)
         self.assertLess(elapsed, 10, f"DROP TABLE took {elapsed:.3f}s, expected < 10s")
 
     def test_show_tables(self):
@@ -334,10 +356,7 @@ class TestDDLAndWritePathPerformance(unittest.TestCase):
         elapsed = time.perf_counter() - start
         cursor.close()
 
-        print(
-            f"\n[perf][{self.backend}] SHOW TABLES: {elapsed:.3f}s "
-            f"({len(rows)} table(s) listed)"
-        )
+        log.info("[perf][%s] SHOW TABLES: %.3fs (%d table(s))", self.backend, elapsed, len(rows))
         self.assertLess(elapsed, 5, f"SHOW TABLES took {elapsed:.3f}s, expected < 5s")
 
     def test_describe_table(self):
@@ -352,8 +371,8 @@ class TestDDLAndWritePathPerformance(unittest.TestCase):
         elapsed = time.perf_counter() - start
         cursor.close()
 
-        print(
-            f"\n[perf][{self.backend}] DESCRIBE TABLE {self.ref_table}: "
-            f"{elapsed:.3f}s ({len(rows)} column(s))"
+        log.info(
+            "[perf][%s] DESCRIBE TABLE %s: %.3fs (%d column(s))",
+            self.backend, self.ref_table, elapsed, len(rows),
         )
         self.assertLess(elapsed, 5, f"DESCRIBE TABLE took {elapsed:.3f}s, expected < 5s")
