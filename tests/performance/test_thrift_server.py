@@ -1,50 +1,43 @@
-import time
 import queue
-import threading
 import statistics
-import pytest
+import threading
+import time
 import unittest
+
+import pytest
 from pyhive import hive
+
 from tests.performance.conftest import _HOST, _PORT, _USER, _AUTH
 
 pytestmark = [
     pytest.mark.performance,
-    pytest.mark.skip_profile("spark_session", "databricks_cluster", "databricks_sql_endpoint", "databricks_http_cluster"),
+    pytest.mark.skip_profile(
+        "spark_session",
+        "databricks_cluster",
+        "databricks_sql_endpoint",
+        "databricks_http_cluster",
+    ),
 ]
 
-'''
-Test file should be runnable in isolation, so recreate table to avoid 'no table found' error
-'''
-@pytest.fixture(scope="module", autouse=True)
-def setup_large_table(thrift_connection):
-    cursor = thrift_connection.cursor()
-    cursor.execute("DROP TABLE IF EXISTS perf_test_10k")
-    sql = """
-        CREATE TABLE perf_test_10k
-        AS SELECT
-            CAST(id AS INT)                      AS id,
-            CONCAT('name_', CAST(id AS STRING))  AS name,
-            CAST(id AS DOUBLE) * 1.5             AS value
-        FROM (SELECT explode(sequence(0, 9999)) AS id) t
-    """
-    cursor.execute(sql)
-    cursor.close()
-    yield
-    cursor = thrift_connection.cursor()
-    cursor.execute("DROP TABLE IF EXISTS perf_test_10k")
-    cursor.close()
 
+# ---------------------------------------------------------------------------
+# Thrift transport layer benchmarks.
+# Tests are Thrift-specific and must not run against non-Thrift profiles.
+# ---------------------------------------------------------------------------
 class TestThriftServerPerformance(unittest.TestCase):
 
     @pytest.fixture(autouse=True)
-    def _inject_fixtures(self, thrift_connection):
+    def _inject_fixtures(self, thrift_connection, spark_backend, reference_dataset):
         self.conn = thrift_connection
+        self.backend = spark_backend
+        self.ref_table = reference_dataset
 
-    '''
-    Records per query latency (send + receive), track median for consistency and max for worst case behavior
-    Asserts median latency < 2s & max latency < 5s
-    '''
     def test_query_round_trip_latency(self):
+        """
+        Records per-query latency (send + receive) over 10 iterations.
+        Tracks median for consistency and max for worst-case behaviour.
+        Asserts median < 2s and max < 5s.
+        """
         cursor = self.conn.cursor()
         latencies = []
 
@@ -58,15 +51,18 @@ class TestThriftServerPerformance(unittest.TestCase):
         median_latency = statistics.median(latencies)
         max_latency = max(latencies)
 
-        print(f"\n[perf] round-trip latency — median: {median_latency:.3f}s, max: {max_latency:.3f}s")
+        print(
+            f"\n[perf][{self.backend}] round-trip latency — "
+            f"median: {median_latency:.3f}s, max: {max_latency:.3f}s"
+        )
         self.assertLess(median_latency, 2, f"Median latency {median_latency:.3f}s exceeded 2s")
         self.assertLess(max_latency, 5, f"Max latency {max_latency:.3f}s exceeded 5s")
 
-    '''
-    Test connection establishment time under concurrent connections
-    Asserts all connections complete within 15s and no exceptions are raised
-    '''
     def test_concurrent_connections(self):
+        """
+        Tests connection establishment time under concurrent load.
+        Asserts all 5 connections complete within 15s with no exceptions.
+        """
         results = queue.Queue()
 
         def connect_and_query():
@@ -89,20 +85,18 @@ class TestThriftServerPerformance(unittest.TestCase):
         threads = [threading.Thread(target=connect_and_query) for _ in range(5)]
 
         start = time.perf_counter()
-
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=15)
-
         elapsed = time.perf_counter() - start
 
-        # Check for hung threads before the elapsed time assertion, so a stuck
-        # thread is reported as a hang rather than a slow run
+        # Check for hung threads before the elapsed assertion so a stuck
+        # thread is reported as a hang rather than a slow run.
         hung_threads = [t for t in threads if t.is_alive()]
         self.assertFalse(hung_threads, f"{len(hung_threads)} threads did not complete within 15s")
 
-        print(f"\n[perf] 5 concurrent connections: {elapsed:.3f}s")
+        print(f"\n[perf][{self.backend}] 5 concurrent connections: {elapsed:.3f}s")
         self.assertLess(elapsed, 15, f"Concurrent connections took {elapsed:.3f}s, expected < 15s")
 
         errors = []
@@ -110,14 +104,14 @@ class TestThriftServerPerformance(unittest.TestCase):
             status, exc = results.get()
             if status == "error":
                 errors.append(str(exc))
-
         self.assertFalse(errors, f"Errors in concurrent connections: {errors}")
 
-    '''
-    Checks if the Thrift server slows down or accumulates latency over 10 sequential queries on the same session
-    Asserts time < 20s
-    '''
     def test_concurrent_queries(self):
+        """
+        Checks whether the Thrift server slows down or accumulates latency
+        over 10 sequential queries on the same session.
+        Asserts total time < 20s.
+        """
         cursor = self.conn.cursor()
         start = time.perf_counter()
         for _ in range(10):
@@ -126,22 +120,25 @@ class TestThriftServerPerformance(unittest.TestCase):
         elapsed = time.perf_counter() - start
         cursor.close()
 
-        print(f"\n10 sequential queries on single connection: {elapsed:.3f}s")
+        print(f"\n[perf][{self.backend}] 10 sequential queries on single connection: {elapsed:.3f}s")
         self.assertLess(elapsed, 20, f"10 sequential queries took {elapsed:.3f}s, expected < 20s")
 
-    '''
-    Test the Thrift layer's ability to stream 10,000 rows back to the client without dropping data or timing out
-    '''
     def test_large_result_set(self):
+        """
+        Tests the Thrift layer's ability to stream all rows of the reference
+        dataset back to the client without dropping data or timing out.
+        """
         cursor = self.conn.cursor()
 
         start = time.perf_counter()
-        cursor.execute("SELECT * FROM perf_test_10k")
+        cursor.execute(f"SELECT * FROM {self.ref_table}")
         rows = cursor.fetchall()
         elapsed = time.perf_counter() - start
-
         cursor.close()
 
-        print(f"\nlarge result set: {elapsed:.3f}s, rows received: {len(rows)}")
+        print(
+            f"\n[perf][{self.backend}] large result set from {self.ref_table}: "
+            f"{elapsed:.3f}s, rows received: {len(rows)}"
+        )
         self.assertEqual(len(rows), 10000, f"Expected 10000 rows, got {len(rows)}")
         self.assertLess(elapsed, 10, f"Large result set fetch took {elapsed:.3f}s, expected < 10s")

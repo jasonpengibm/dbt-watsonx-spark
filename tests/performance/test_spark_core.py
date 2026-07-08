@@ -1,41 +1,44 @@
-import time
-import pytest
-import psutil
-from pyhive import hive
+import gc
 import queue
-import threading
 import statistics
+import threading
+import time
+import unittest
+
+import psutil
+import pytest
+from pyhive import hive
+
 from tests.performance.conftest import _HOST, _PORT, _USER, _AUTH
 from tests.performance.utils.memory_utils import profile_memory
-import unittest
-import gc
 
 pytestmark = [
     pytest.mark.performance,
     pytest.mark.skip_profile("spark_session"),
 ]
 
-@pytest.fixture(scope="module", autouse=True)
-def cleanup_perf_tables(thrift_connection):
+
+@pytest.fixture(scope="module")
+def cleanup_ddl_tables(thrift_connection):
+    """Drops all scratch tables created by TestDDLAndWritePathPerformance."""
     yield
     cursor = thrift_connection.cursor()
-    cursor.execute("DROP TABLE IF EXISTS perf_test_1k")
-    cursor.execute("DROP TABLE IF EXISTS perf_test_10k")
+    for table in ("perf_ctas_out", "perf_insert_target", "perf_drop_scratch"):
+        cursor.execute(f"DROP TABLE IF EXISTS {table}")
     cursor.close()
 
 
-"""
-Benchmark latency for connecting, creating tables, and
-querying via Thrift.
-"""
+# ---------------------------------------------------------------------------
+# Benchmark latency for connecting, creating tables, and querying via Thrift.
+# ---------------------------------------------------------------------------
 class TestConnectionAndQueryPerformance(unittest.TestCase):
-    @pytest.fixture(autouse=True)
-    def _inject_fixtures(self, thrift_connection):
-        self.conn = thrift_connection
 
-    '''
-    Measures how long a single Thrift connection takes to open.
-    '''
+    @pytest.fixture(autouse=True)
+    def _inject_fixtures(self, thrift_connection, spark_backend, reference_dataset):
+        self.conn = thrift_connection
+        self.backend = spark_backend
+        self.ref_table = reference_dataset
+
     def test_connection_establishment_time(self):
         """Measures how long a single Thrift connection takes to open."""
         start = time.perf_counter()
@@ -47,82 +50,38 @@ class TestConnectionAndQueryPerformance(unittest.TestCase):
         )
         elapsed = time.perf_counter() - start
         conn.close()
-        print(f"\n[perf] connection establishment: {elapsed:.3f}s")
+        print(f"\n[perf][{self.backend}] connection establishment: {elapsed:.3f}s")
         self.assertLess(elapsed, 10, f"Connection took {elapsed:.3f}s, expected < 10s")
 
-    """
-    Measures how long a 1k row table creation takes.
-    """
-    def test_large_table_creation_1k(self):
-        cursor = self.conn.cursor()
-        cursor.execute("DROP TABLE IF EXISTS perf_test_1k")
-
-        sql = """
-            CREATE TABLE perf_test_1k
-            AS SELECT
-                CAST(id AS INT)                      AS id,
-                CONCAT('name_', CAST(id AS STRING))  AS name,
-                CAST(id AS DOUBLE) * 1.5             AS value
-            FROM (SELECT explode(sequence(0, 999)) AS id) t
-        """
-
-        start = time.perf_counter()
-        cursor.execute(sql)
-        elapsed = time.perf_counter() - start
-
-        print(f"\n[perf] 1k table creation: {elapsed:.3f}s")
-        self.assertLess(elapsed, 30, f"1k table creation took {elapsed:.3f}s, expected < 30s")
-        cursor.close()
-
-
-    """
-    Measures how long a 10k row table creation takes.
-    """
-    def test_large_table_creation_10k(self):
-        cursor = self.conn.cursor()
-        cursor.execute("DROP TABLE IF EXISTS perf_test_10k")
-
-        sql = """
-            CREATE TABLE perf_test_10k
-            AS SELECT
-                CAST(id AS INT)                      AS id,
-                CONCAT('name_', CAST(id AS STRING))  AS name,
-                CAST(id AS DOUBLE) * 1.5             AS value
-            FROM (SELECT explode(sequence(0, 9999)) AS id) t
-        """
-
-        start = time.perf_counter()
-        cursor.execute(sql)
-        elapsed = time.perf_counter() - start
-
-        print(f"\n[perf] 10k table creation: {elapsed:.3f}s")
-        self.assertLess(elapsed, 60, f"10k table creation took {elapsed:.3f}s, expected < 60s")
-        cursor.close()
-
-    '''
-    Measures how long a query takes to run on 10k table
-    '''
     def test_query_run_time(self):
+        """Measures COUNT(*) latency against the fixed reference dataset."""
         cursor = self.conn.cursor()
         start = time.perf_counter()
-        cursor.execute("SELECT COUNT(*) FROM perf_test_10k")
+        cursor.execute(f"SELECT COUNT(*) FROM {self.ref_table}")
         result = cursor.fetchall()
         elapsed = time.perf_counter() - start
+        cursor.close()
 
-        print(f"\n[perf] query COUNT(*) on 10k rows: {elapsed:.3f}s, result: {result[0][0]}")
+        print(
+            f"\n[perf][{self.backend}] COUNT(*) on {self.ref_table}: "
+            f"{elapsed:.3f}s, rows: {result[0][0]}"
+        )
         self.assertEqual(result[0][0], 10000, f"Expected 10000 rows, got {result[0][0]}")
         self.assertLess(elapsed, 5, f"Query took {elapsed:.3f}s, expected < 5s")
         cursor.close()
 
 
-"""
-Tests behavior under concurrent connection and query load 
-by opening multiple threads running Spark jobs simultaneously.
-"""
+# ---------------------------------------------------------------------------
+# Tests behavior under concurrent connection and query load.
+# ---------------------------------------------------------------------------
 class TestConcurrentOperations(unittest.TestCase):
-    """
-    Runs 5 concurrent Spark queries and checks they all complete cleanly.
-    """
+    """Runs 5 concurrent Spark queries and checks they all complete cleanly."""
+
+    @pytest.fixture(autouse=True)
+    def _inject_fixtures(self, spark_backend, reference_dataset):
+        self.backend = spark_backend
+        self.ref_table = reference_dataset
+
     def test_concurrent_spark_operations(self):
         results = queue.Queue()
 
@@ -139,7 +98,7 @@ class TestConcurrentOperations(unittest.TestCase):
                 # Partition unique data to each thread to simulate jobs doing different work
                 cursor.execute(
                     f"SELECT COUNT(*), SUM(value), AVG(value) "
-                    f"FROM perf_test_10k WHERE id % 5 = {job_id}"
+                    f"FROM {self.ref_table} WHERE id % 5 = {job_id}"
                 )
                 result = cursor.fetchall()
                 elapsed = time.perf_counter() - start
@@ -172,11 +131,11 @@ class TestConcurrentOperations(unittest.TestCase):
                 job_times.append(item[2])
 
         self.assertFalse(errors, f"Concurrent Spark jobs raised exceptions: {errors}")
-        # Thread could exit early due to a swallowed exception, make sure it accounts for itself
+        # Thread could exit early due to a swallowed exception; ensure it accounts for itself
         self.assertEqual(len(job_times), num_jobs, f"Expected {num_jobs} results, got {len(job_times)}")
 
         print(
-            f"\n[perf] {num_jobs} concurrent Spark jobs:\n"
+            f"\n[perf][{self.backend}] {num_jobs} concurrent Spark jobs:\n"
             f"total: {total_elapsed:.3f}s\n"
             f"per-job median: {statistics.median(job_times):.3f}s\n"
             f"per-job max: {max(job_times):.3f}s"
@@ -184,22 +143,19 @@ class TestConcurrentOperations(unittest.TestCase):
         self.assertLess(total_elapsed, 60, f"Concurrent Spark jobs took {total_elapsed:.3f}s, expected < 60s")
 
 
-"""
-Measure OS-level RSS memory growth across connection, cursor, and exception
-lifecycles to catch resource leaks in the adapter.
-"""
+# ---------------------------------------------------------------------------
+# Measure OS-level RSS memory growth across connection, cursor, and exception
+# lifecycles to catch resource leaks in the adapter.
+# ---------------------------------------------------------------------------
 class TestMemoryUsage(unittest.TestCase):
+
     @pytest.fixture(autouse=True)
-    def _inject_fixtures(self, thrift_connection):
+    def _inject_fixtures(self, thrift_connection, spark_backend):
         self.conn = thrift_connection
+        self.backend = spark_backend
 
-    """
-    Opens 20 connections concurrently and measures OS-level RSS growth.
-    """
     def test_memory_concurrent_connections(self):
-
-        # Force garbage collection before measuring so unrelated pending
-        # garbage from prior tests doesn't affect the base RSS amount
+        """Opens 20 connections concurrently and measures OS-level RSS growth."""
         gc.collect()
         rss_before = psutil.Process().memory_info().rss
 
@@ -238,23 +194,18 @@ class TestMemoryUsage(unittest.TestCase):
             if item[0] == "error":
                 errors.append(f"Thread {item[1]}: {item[2]}")
         self.assertFalse(errors, f"Connection threads raised exceptions: {errors}")
-        
-        # Collect again post-run so RSS does not reflect garbage waiting to be cleaned
-        gc.collect()
 
-        # Sample RSS after operation, memory should return near starting point after all connections torn down 
+        gc.collect()
         rss_after = psutil.Process().memory_info().rss
         rss_delta_mb = (rss_after - rss_before) / (1024 ** 2)
-        print(f"\n[mem] concurrent_connections: rss_delta={rss_delta_mb:.1f} MB")
+        print(f"\n[mem][{self.backend}] concurrent_connections: rss_delta={rss_delta_mb:.1f} MB")
         self.assertLess(
             rss_delta_mb, 150,
             f"RSS grew by {rss_delta_mb:.1f} MB across 20 connections, expected < 150 MB"
         )
 
-    """
-    Opens and closes 20 cursors sequentially on the shared connection.
-    """
     def test_memory_no_leak_after_cursor_close(self):
+        """Opens and closes 20 cursors sequentially on the shared connection."""
         def run():
             for _ in range(20):
                 cursor = self.conn.cursor()
@@ -262,21 +213,22 @@ class TestMemoryUsage(unittest.TestCase):
                 cursor.fetchall()
                 cursor.close()
 
-        result = profile_memory(run, label="cursor_close_leak")
+        result = profile_memory(run, label="cursor_close_leak", backend=self.backend)
 
-        # RSS after should be less than 15% of original RSS because Python memory allocator does not 
-        # return freed pages immediately. A genuine memory leak would be higher than this threshold 
+        # RSS after should be less than 15% of original RSS because Python's memory
+        # allocator does not return freed pages immediately.  A genuine leak would
+        # exceed this threshold.
         self.assertLessEqual(
             result["rss_after_mb"], result["rss_before_mb"] * 1.15,
             f"RSS grew from {result['rss_before_mb']:.1f} MB to {result['rss_after_mb']:.1f} MB "
             f"(delta {result['rss_delta_mb']:.1f} MB) after 20 cursor close cycles — possible leak"
         )
 
-    """
-    Runs 20 cursor executions against a nonexistent table and measures
-    whether the exception path leaves unreclaimed memory.
-    """
     def test_memory_no_leak_on_exception(self):
+        """
+        Runs 20 cursor executions against a nonexistent table and measures
+        whether the exception path leaves unreclaimed memory.
+        """
         def run():
             for _ in range(20):
                 cursor = self.conn.cursor()
@@ -287,9 +239,121 @@ class TestMemoryUsage(unittest.TestCase):
                 finally:
                     cursor.close()
 
-        result = profile_memory(run, label="exception_cursor_leak")
+        result = profile_memory(run, label="exception_cursor_leak", backend=self.backend)
         self.assertLess(
             result["rss_delta_mb"], 30,
             f"RSS grew by {result['rss_delta_mb']:.1f} MB across 20 exception-path cursor cycles, "
             f"expected < 30 MB — possible session resource leak on exception"
         )
+
+
+# ---------------------------------------------------------------------------
+# Benchmark the DDL and write-path operations dbt issues during a real run.
+#
+# Covers: CREATE TABLE AS SELECT, INSERT INTO, DROP TABLE, SHOW TABLES,
+#         and DESCRIBE TABLE — the operations that dbt's table, incremental,
+#         and introspection paths rely on.
+# ---------------------------------------------------------------------------
+class TestDDLAndWritePathPerformance(unittest.TestCase):
+
+    @pytest.fixture(autouse=True)
+    def _inject_fixtures(self, thrift_connection, spark_backend, reference_dataset, cleanup_ddl_tables):
+        self.conn = thrift_connection
+        self.backend = spark_backend
+        self.ref_table = reference_dataset
+
+    def test_create_table_as_select(self):
+        """
+        Benchmarks CREATE TABLE AS SELECT — the core operation of every dbt
+        table materialisation.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS perf_ctas_out")
+
+        start = time.perf_counter()
+        cursor.execute(
+            f"CREATE TABLE perf_ctas_out AS SELECT * FROM {self.ref_table}"
+        )
+        elapsed = time.perf_counter() - start
+        cursor.close()
+
+        print(f"\n[perf][{self.backend}] CTAS from {self.ref_table}: {elapsed:.3f}s")
+        self.assertLess(elapsed, 30, f"CTAS took {elapsed:.3f}s, expected < 30s")
+
+    def test_insert_into_select(self):
+        """
+        Benchmarks INSERT INTO … SELECT — the core write operation of every
+        dbt incremental materialisation.
+        """
+        cursor = self.conn.cursor()
+        # Create a schema-matched empty target table first
+        cursor.execute("DROP TABLE IF EXISTS perf_insert_target")
+        cursor.execute(
+            "CREATE TABLE perf_insert_target (id INT, name STRING, value DOUBLE)"
+        )
+
+        start = time.perf_counter()
+        cursor.execute(
+            f"INSERT INTO perf_insert_target SELECT * FROM {self.ref_table}"
+        )
+        elapsed = time.perf_counter() - start
+        cursor.close()
+
+        print(f"\n[perf][{self.backend}] INSERT INTO from {self.ref_table}: {elapsed:.3f}s")
+        self.assertLess(elapsed, 30, f"INSERT INTO took {elapsed:.3f}s, expected < 30s")
+
+    def test_drop_table(self):
+        """
+        Benchmarks DROP TABLE — issued by dbt before every full-refresh
+        table materialisation and at the end of incremental swaps.
+        """
+        cursor = self.conn.cursor()
+        # Create a minimal scratch table to drop
+        cursor.execute("DROP TABLE IF EXISTS perf_drop_scratch")
+        cursor.execute(
+            "CREATE TABLE perf_drop_scratch (id INT)"
+        )
+
+        start = time.perf_counter()
+        cursor.execute("DROP TABLE IF EXISTS perf_drop_scratch")
+        elapsed = time.perf_counter() - start
+        cursor.close()
+
+        print(f"\n[perf][{self.backend}] DROP TABLE: {elapsed:.3f}s")
+        self.assertLess(elapsed, 10, f"DROP TABLE took {elapsed:.3f}s, expected < 10s")
+
+    def test_show_tables(self):
+        """
+        Benchmarks SHOW TABLES — issued by dbt's relation cache and
+        schema-check introspection; latency compounds across every model.
+        """
+        cursor = self.conn.cursor()
+        start = time.perf_counter()
+        cursor.execute("SHOW TABLES")
+        rows = cursor.fetchall()
+        elapsed = time.perf_counter() - start
+        cursor.close()
+
+        print(
+            f"\n[perf][{self.backend}] SHOW TABLES: {elapsed:.3f}s "
+            f"({len(rows)} table(s) listed)"
+        )
+        self.assertLess(elapsed, 5, f"SHOW TABLES took {elapsed:.3f}s, expected < 5s")
+
+    def test_describe_table(self):
+        """
+        Benchmarks DESCRIBE TABLE — issued by dbt's column introspection
+        during --check-cols and schema drift detection.
+        """
+        cursor = self.conn.cursor()
+        start = time.perf_counter()
+        cursor.execute(f"DESCRIBE TABLE {self.ref_table}")
+        rows = cursor.fetchall()
+        elapsed = time.perf_counter() - start
+        cursor.close()
+
+        print(
+            f"\n[perf][{self.backend}] DESCRIBE TABLE {self.ref_table}: "
+            f"{elapsed:.3f}s ({len(rows)} column(s))"
+        )
+        self.assertLess(elapsed, 5, f"DESCRIBE TABLE took {elapsed:.3f}s, expected < 5s")
