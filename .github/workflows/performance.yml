@@ -84,12 +84,12 @@ jobs:
       - name: Wait for Thrift server to be ready
         run: |
           echo "Waiting for Spark Thrift server on port 10000..."
-          for i in $(seq 1 30); do
-            if nc -z localhost 10000; then
-              echo "Thrift server is up after ${i} attempts"
+          for i in $(seq 1 40); do
+            if docker compose logs dbt-spark3-thrift 2>/dev/null | grep -q "HiveThriftServer2 started"; then
+              echo "HiveThriftServer2 ready after ${i} attempts"
               exit 0
             fi
-            echo "Attempt ${i}/30 — not ready yet, sleeping 10s"
+            echo "Attempt ${i}/40 — not ready yet, sleeping 10s"
             sleep 10
           done
           echo "Thrift server did not become ready in time" >&2
@@ -102,6 +102,7 @@ jobs:
           SPARK_THRIFT_PORT: "10000"
           SPARK_THRIFT_USER: dbt
           SPARK_THRIFT_AUTH: NOSASL
+          SPARK_BACKEND: standard
         run: |
           python -m pytest \
             --color=yes \

@@ -43,4 +43,9 @@
         <name>hive.metastore.schema.verification</name>
         <value>false</value>
     </property>
+
+    <property>
+        <name>hive.server2.authentication</name>
+        <value>NOSASL</value>
+    </property>
 </configuration>
