@@ -22,6 +22,7 @@ SPARK_THRIFT_HOST=localhost SPARK_THRIFT_PORT=10000 \
 SPARK_THRIFT_USER=dbt SPARK_THRIFT_AUTH=NOSASL SPARK_BACKEND=standard \
 python3 -m pytest --csv performance_results.csv -v -m performance tests/performance
 
+# Run this for formatted/filtered results
 python3 tests/performance/summarise_results.py \
   --input performance_results.csv \
   --output tests/performance/performance_results.csv
