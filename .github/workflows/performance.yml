@@ -106,10 +106,17 @@ jobs:
         run: |
           python -m pytest \
             --color=yes \
-            --csv performance_results.csv \
+            --csv performance_results_raw.csv \
             -v \
             -m performance \
             tests/performance
+
+      - name: Summarise results
+        if: always()
+        run: |
+          python tests/performance/summarise_results.py \
+            --input  performance_results_raw.csv \
+            --output performance_results.csv
 
       - name: Get current date
         if: always()
