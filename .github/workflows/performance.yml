@@ -103,6 +103,7 @@ jobs:
           SPARK_THRIFT_USER: dbt
           SPARK_THRIFT_AUTH: NOSASL
           SPARK_BACKEND: standard
+          SPARK_UI_URL: http://localhost:4040
         run: |
           python -m pytest \
             --color=yes \
