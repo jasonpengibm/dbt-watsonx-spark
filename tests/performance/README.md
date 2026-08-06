@@ -30,6 +30,31 @@ python3 tests/performance/summarise_results.py \
 
 ## Recording results
 
-After every run, **commit the updated `tests/performance/performance_results.csv`** and **paste the table into your PR description** so reviewers can see the numbers without running the suite themselves.
+Every run **should** be recorded on the PR
+
+**Locally:**
+
+1. Run the two commands under _Testing locally_ above.
+2. Commit the updated `tests/performance/performance_results.csv`.
+3. Paste the block below into your PR description (or a new PR comment), filling in the table from the CSV:
+
+   ````markdown
+   ### Performance run — <date> / Python <version> / backend <standard|gluten>
+
+   Command:
+
+   ```bash
+   python3 -m pytest --csv performance_results.csv -v -m performance tests/performance
+   python3 tests/performance/summarise_results.py \
+     --input performance_results.csv \
+     --output tests/performance/performance_results.csv
+   ```
+
+   | class | test | duration_s | threshold | result |
+   | ----- | ---- | ---------- | --------- | ------ |
+   | …     | …    | …          | …         | …      |
+   ````
+
+**In CI:** the `Performance Tests` workflow runs `summarise_results.py` after pytest and uploads the cleaned `performance_results.csv` as an artifact (`performance_results_<python-version>-<timestamp>.csv`) — grab it from the workflow run for any push that didn't come with a local paste.
 
 The CSV contains: `class`, `test`, `description`, `status`, `duration_s`, `threshold`, `result` (`PASS` / `WARN` / `FAIL`), `notes`.
