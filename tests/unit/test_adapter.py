@@ -218,7 +218,7 @@ class TestSparkAdapter(unittest.TestCase):
         adapter = SparkAdapter(config, get_context("spawn"))
 
         def hive_thrift_connect(
-            host, port, username, auth, kerberos_service_name, password, configuration
+            host, port, username, auth, kerberos_service_name, password, configuration, database=None
         ):
             self.assertEqual(host, "myorg.sparkhost.com")
             self.assertEqual(port, 10001)
@@ -241,7 +241,7 @@ class TestSparkAdapter(unittest.TestCase):
         config = self._get_target_use_ssl_thrift(self.project_cfg)
         adapter = SparkAdapter(config, get_context("spawn"))
 
-        def hive_thrift_connect(thrift_transport, configuration):
+        def hive_thrift_connect(thrift_transport, configuration, database=None):
             self.assertIsNotNone(thrift_transport)
             transport = thrift_transport._trans
             self.assertEqual(transport.host, "myorg.sparkhost.com")
@@ -268,7 +268,7 @@ class TestSparkAdapter(unittest.TestCase):
         adapter = SparkAdapter(config, get_context("spawn"))
 
         def hive_thrift_connect(
-            host, port, username, auth, kerberos_service_name, password, configuration
+            host, port, username, auth, kerberos_service_name, password, configuration, database=None
         ):
             self.assertEqual(host, "myorg.sparkhost.com")
             self.assertEqual(port, 10001)
